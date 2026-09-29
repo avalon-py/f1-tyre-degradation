@@ -91,6 +91,14 @@ def simulate_strategy(compounds: dict, total_laps: int, pit_lap: int,
 
 
 def find_best_strategy(compounds: dict, total_laps: int) -> dict:
+    """
+    Best strategy is found across ALL pit laps (the model needs the full
+    picture to compare options fairly), but flagged if either resulting
+    stint length exceeds the longest stint actually observed for that
+    compound -- past that point the linear degradation fit is
+    extrapolating, and a real tyre could behave very differently (a
+    cliff-off is common and this model can't see it).
+    """
     available = list(compounds.keys())
     best = {"time_s": float("inf")}
 
@@ -98,12 +106,31 @@ def find_best_strategy(compounds: dict, total_laps: int) -> dict:
         for pit_lap in range(3, total_laps - 2):
             t = simulate_strategy(compounds, total_laps, pit_lap, c1, c2)
             if t < best["time_s"]:
+                stint_2_length = total_laps - pit_lap
                 best = {
                     "time_s": round(t, 1),
                     "compound_1": c1,
                     "compound_2": c2,
                     "pit_lap": pit_lap,
+                    "stint_1_length": pit_lap,
+                    "stint_2_length": stint_2_length,
                 }
+
+    max_1 = compounds[best["compound_1"]].get("max_observed_tyre_life")
+    max_2 = compounds[best["compound_2"]].get("max_observed_tyre_life")
+    extrapolated = []
+    if max_1 is not None and best["stint_1_length"] > max_1:
+        extrapolated.append(f"{best['compound_1']} stint ({best['stint_1_length']} laps > {max_1} observed)")
+    if max_2 is not None and best["stint_2_length"] > max_2:
+        extrapolated.append(f"{best['compound_2']} stint ({best['stint_2_length']} laps > {max_2} observed)")
+    best["extrapolated_beyond_data"] = extrapolated
+    if extrapolated:
+        logger.warning(
+            "Best strategy extrapolates beyond observed data: %s. Treat this "
+            "recommendation with caution -- the linear model has no evidence "
+            "for how the tyre actually behaves that far into a stint.",
+            "; ".join(extrapolated),
+        )
     return best
 
 
