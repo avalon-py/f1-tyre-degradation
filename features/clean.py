@@ -41,6 +41,12 @@ def clean_laps(laps: pd.DataFrame) -> pd.DataFrame:
     df = df[~df["TrackStatus"].astype(str).isin(NON_GREEN_STATUS_CODES)]
     df = df[df["LapTime"].notna()]
 
+    # Lap 1 is a standing start -- cold tyres, first-corner bunching, not
+    # representative tyre wear. It's not a pit lap and not flagged by track
+    # status, so it needs its own filter. Confirmed via EDA: lap 1 averaged
+    # ~106.5s at Bahrain 2025 vs ~100.5-100.9s for laps 2-5.
+    df = df[df["LapNumber"] > 1]
+
     df["LapTimeSeconds"] = df["LapTime"].dt.total_seconds()
 
     # Fuel correction: lap 1 is the heaviest, so later laps get time added
