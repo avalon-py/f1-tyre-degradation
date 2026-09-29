@@ -23,31 +23,85 @@ PROCESSED_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
 EXPERIMENTS_DIR = Path(__file__).resolve().parent.parent / "experiments"
 
 
+MIN_LAPS_PER_STINT = 6  # raised from 4 -- a slope fit on 4-5 laps is too easily
+                          # swung by a single noisy lap (traffic, small error)
+
+
+def _fit_one_stint(group: pd.DataFrame) -> dict | None:
+    """Fits TyreLife -> LapTimeCorrected for a single driver's single stint."""
+    if len(group) < MIN_LAPS_PER_STINT:
+        return None
+    X = group[["TyreLife"]].values
+    y = group["LapTimeCorrected"].values
+    model = LinearRegression().fit(X, y)
+    return {
+        "intercept_s": float(model.intercept_),
+        "slope_s_per_lap": float(model.coef_[0]),
+        "n_laps": int(len(group)),
+        "r_squared": float(model.score(X, y)),
+    }
+
+
+def stint_slopes_for_compound(cleaned: pd.DataFrame, compound: str) -> pd.DataFrame:
+    """Debug helper: one row per driver-stint with its fitted slope, so you
+    can spot which stints are dragging an average around before trusting it."""
+    rows = []
+    subset = cleaned[cleaned["Compound"] == compound]
+    for (driver, stint), group in subset.groupby(["Driver", "Stint"]):
+        fit = _fit_one_stint(group)
+        if fit is not None:
+            rows.append({"Driver": driver, "Stint": stint, **fit})
+    return pd.DataFrame(rows).sort_values("slope_s_per_lap")
+
+
 def fit_degradation(cleaned: pd.DataFrame) -> dict:
     """
-    Returns, per compound: intercept (s), slope (s/lap of tyre age), and
-    n_laps used. TyreLife is FastF1's tyre-age-in-laps column.
+    Returns, per compound: mean intercept and slope across individual
+    driver-stints, not one pooled regression across all drivers. Pooling
+    everyone together confounds "faster driver" with "less tyre wear" --
+    e.g. if quicker cars happen to run longer stints, the pooled fit can
+    end up flat or even negative even when every individual stint shows
+    clean positive degradation. Fitting per stint and averaging avoids
+    that confound. n_stints_used tells you how many stints had enough
+    laps (>=4) to fit; n_laps is the total laps behind those stints.
     """
     results = {}
-    for compound, group in cleaned.groupby("Compound"):
-        if len(group) < 5:
-            logger.warning("Skipping %s: only %d laps, too few to fit", compound, len(group))
+    for compound, compound_group in cleaned.groupby("Compound"):
+        stint_fits = []
+        for (_driver, _stint), stint_group in compound_group.groupby(["Driver", "Stint"]):
+            fit = _fit_one_stint(stint_group)
+            if fit is not None:
+                stint_fits.append(fit)
+
+        if len(stint_fits) < 3:
+            logger.warning(
+                "Skipping %s: only %d fittable stints, too few to average", compound, len(stint_fits)
+            )
             continue
 
-        X = group[["TyreLife"]].values
-        y = group["LapTimeCorrected"].values
+        slopes = np.array([f["slope_s_per_lap"] for f in stint_fits])
+        intercepts = np.array([f["intercept_s"] for f in stint_fits])
 
-        model = LinearRegression().fit(X, y)
+        # Median, not mean -- per-stint slopes are heavy-tailed (a single
+        # messy stint can swing a mean far more than it should). Mean is
+        # still reported for comparison/transparency, since a mean vs.
+        # median gap is itself a useful "how skewed is this" signal.
         results[compound] = {
-            "intercept_s": round(float(model.intercept_), 3),
-            "slope_s_per_lap": round(float(model.coef_[0]), 4),
-            "n_laps": int(len(group)),
-            "r_squared": round(float(model.score(X, y)), 3),
+            "intercept_s": round(float(np.median(intercepts)), 3),
+            "slope_s_per_lap": round(float(np.median(slopes)), 4),
+            "slope_mean": round(float(np.mean(slopes)), 4),
+            "slope_std": round(float(np.std(slopes)), 4),
+            "n_stints_used": len(stint_fits),
+            "n_laps": int(sum(f["n_laps"] for f in stint_fits)),
+            "pct_stints_positive_slope": round(float((slopes > 0).mean()), 3),
         }
         logger.info(
-            "%s: %.3fs base + %.4fs/lap degradation (n=%d, R2=%.3f)",
+            "%s: %.3fs base + %.4fs/lap degradation [median] (mean=%.4f, std=%.4f, "
+            "stints=%d, n_laps=%d, %.0f%% of stints positive)",
             compound, results[compound]["intercept_s"], results[compound]["slope_s_per_lap"],
-            results[compound]["n_laps"], results[compound]["r_squared"],
+            results[compound]["slope_mean"], results[compound]["slope_std"],
+            results[compound]["n_stints_used"],
+            results[compound]["n_laps"], 100 * results[compound]["pct_stints_positive_slope"],
         )
     return results
 

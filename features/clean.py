@@ -41,19 +41,32 @@ def clean_laps(laps: pd.DataFrame) -> pd.DataFrame:
     df = df[~df["TrackStatus"].astype(str).isin(NON_GREEN_STATUS_CODES)]
     df = df[df["LapTime"].notna()]
 
-    # Lap 1 is a standing start -- cold tyres, first-corner bunching, not
-    # representative tyre wear. It's not a pit lap and not flagged by track
-    # status, so it needs its own filter. Confirmed via EDA: lap 1 averaged
-    # ~106.5s at Bahrain 2025 vs ~100.5-100.9s for laps 2-5.
-    df = df[df["LapNumber"] > 1]
+    # Drop the first two laps of every stint (TyreLife <= 2), not just the
+    # race's opening lap. FastF1's TyreLife counts the out-lap itself as
+    # TyreLife==1 -- that lap is already excluded by the pit filter above,
+    # so it alone isn't enough. The first FLYING lap on a fresh set is
+    # TyreLife==2, and that's the one that's unrepresentative: cold tyres
+    # and first-corner bunching at a standing start (confirmed via EDA --
+    # lap 1 averaged ~106.5s at Bahrain 2025 vs ~100.5-100.9s for laps
+    # 2-5), or a bunched, sub-racing-pace restart lap if the stint began
+    # right after a safety car. Confirmed via Bahrain 2025: the SC on lap
+    # 32 (track debris) triggered most front-runners' final stops, and
+    # every one of those stints showed a spurious NEGATIVE degradation
+    # slope before this fix -- restart bunching inflated the early laps of
+    # the stint, which then looked like decay as the field spread back
+    # out. Track status alone doesn't catch this, since the restart lap is
+    # already logged as green by the time it's recorded.
+    df = df[df["TyreLife"] > 2]
 
     df["LapTimeSeconds"] = df["LapTime"].dt.total_seconds()
 
-    # Fuel correction: lap 1 is the heaviest, so later laps get time added
-    # back to make them comparable to a full-fuel lap.
-    max_lap = df["LapNumber"].max()
+    # Fuel correction: the car is heaviest (slowest, fuel-wise) on lap 1 and
+    # lightest (fastest, fuel-wise) on the final lap. To isolate tyre wear,
+    # we need to undo that fuel-driven speedup -- so LATER laps get MORE
+    # time added back, bringing them up to what they'd have run on a full
+    # tank. Anchored so lap 1 gets ~0 correction.
     df["LapTimeCorrected"] = df["LapTimeSeconds"] + FUEL_CORRECTION_S_PER_LAP * (
-        max_lap - df["LapNumber"]
+        df["LapNumber"] - 1
     )
 
     logger.info("Cleaned %d -> %d laps (%.0f%% kept)", n_start, len(df), 100 * len(df) / n_start)
