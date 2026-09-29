@@ -1,0 +1,11 @@
+cache/
+!cache/.gitkeep
+data/raw/
+data/processed/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
