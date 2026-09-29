@@ -1,0 +1,1 @@
+{"year": 2025, "race": "Bahrain", "compounds": {"HARD": {"intercept_s": 104.134, "slope_s_per_lap": -0.2791, "n_laps": 283, "r_squared": 0.073}, "MEDIUM": {"intercept_s": 101.798, "slope_s_per_lap": -0.16, "n_laps": 468, "r_squared": 0.046}, "SOFT": {"intercept_s": 103.516, "slope_s_per_lap": -0.2635, "n_laps": 267, "r_squared": 0.109}}}
