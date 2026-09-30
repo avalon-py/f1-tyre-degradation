@@ -129,6 +129,9 @@ python -m models.simulate --year 2025 --race Bahrain --total-laps 57   # 4. find
 python -m pipeline.run_all_races --year 2025 --race Bahrain
 python -m pipeline.run_all_races --year 2025
 python -m pipeline.summarize_results
+
+# fill in borrowed-compound results from the existing log, without re-downloading:
+python -m pipeline.run_all_races --year 2025 --borrow-only
 ```
 
 By default, `models.simulate` auto-selects whichever compounds passed the
@@ -149,7 +152,7 @@ direction -- data exists, just noisy; overridable via
 `--min-pct-positive`).
 
 Run `pytest` for the test suite. Coverage is currently uneven: thorough
-for `features/clean.py` (9 tests covering the lap-filtering and fuel-
+for `features/clean.py` (12 tests covering the lap-filtering and fuel-
 correction logic), but `models/degradation.py` and `models/simulate.py`
 have real branching logic (median-vs-mean, the reliability threshold, the
 `--compounds` error paths) with no tests yet -- a known gap, not an

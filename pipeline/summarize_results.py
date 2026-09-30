@@ -20,7 +20,7 @@ def load_latest_per_race() -> pd.DataFrame:
     with open(EXPERIMENTS_DIR / "race_results.jsonl") as f:
         for line in f:
             r = json.loads(line)
-            rows[(r["year"], r["race"])] = r  # a re-run replaces the earlier row
+            rows[(r["year"], r["race"])] = r
 
     table = []
     for r in rows.values():
@@ -33,6 +33,7 @@ def load_latest_per_race() -> pd.DataFrame:
             **{f"{c[0]}_slope": compounds[c]["slope_s_per_lap"] if c in compounds else None
                for c in ("SOFT", "MEDIUM", "HARD")},
             "best": (f"{best['compound_1']}->{best['compound_2']} @ lap {best['pit_lap']}"
+                     + (f" *borrowed {sorted(r['borrowed'])}" if r.get("borrowed") else "")
                      if best else f"[{r['status']}] {r.get('reason', '')}"),
         })
     return pd.DataFrame(table)

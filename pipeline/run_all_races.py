@@ -5,9 +5,14 @@ to experiments/race_results.jsonl.
 
 Each race gets its own fuel effect (from its lap count) and its own tyre
 parameters per compound; the simulator only ever sees that one race's
-numbers. A race that can't be modelled (wet, too many interruptions, fewer
-than 2 trustworthy compounds) is recorded as "skipped" with a reason, and
-one that errors out is recorded as "failed" -- the loop never stops.
+numbers. A race that can't be modelled (wet, too many interruptions) is
+recorded as "skipped" with a reason, and one that errors out is recorded as
+"failed" -- the loop never stops.
+
+A strategy needs two different compounds (F1 rule). A race with only one
+trustworthy compound gets a second one *borrowed* from the season: the
+median slope for that compound across races where it was trustworthy, at a
+pace offset from the race's real compound. Those results are flagged.
 
 FastF1's first download per race is slow (30-90s), so a full season on a
 first pass can take 20-40 minutes. Cached after that.
@@ -16,6 +21,7 @@ Usage:
     python -m pipeline.run_all_races --year 2025
     python -m pipeline.run_all_races --year 2025 --race Bahrain    # one race
     python -m pipeline.run_all_races --year 2025 --skip "Monaco Grand Prix"
+    python -m pipeline.run_all_races --year 2025 --borrow-only     # no re-download
 """
 
 import argparse
@@ -24,8 +30,9 @@ import logging
 from pathlib import Path
 
 import fastf1
+import numpy as np
 
-from features.clean import clean_laps, fuel_s_per_lap
+from features.clean import DRY_COMPOUNDS, clean_laps, fuel_s_per_lap
 from ingestion.load_session import check_race_quality, load_race_laps, save_raw
 from models.degradation import fit_degradation, log_result
 from models.simulate import find_best_strategy
@@ -39,6 +46,7 @@ MIN_GREEN_FLAG_PCT = 0.7   # below this the degradation fit is too noisy to trus
 MIN_PCT_POSITIVE = 0.4     # a compound is only simulated if this share of its
                            # stints actually showed degradation (see models.simulate)
 WET_COMPOUNDS = {"INTERMEDIATE", "WET"}
+MIN_RACES_TO_BORROW = 3    # need this many races of evidence for a season median
 
 
 def get_race_names(year: int) -> list[str]:
@@ -92,6 +100,72 @@ def run_one_race(year: int, race: str) -> dict:
     return {**record, "status": "ok", "best_strategy": best}
 
 
+def trustworthy(compounds: dict) -> dict:
+    return {n: p for n, p in compounds.items()
+            if p["pct_stints_positive_slope"] >= MIN_PCT_POSITIVE}
+
+
+def season_medians(records: list[dict]) -> tuple[dict, dict]:
+    """Season-wide (slope, pace offset vs MEDIUM) per compound, from races
+    where the compound was trustworthy. Compounds with too little evidence
+    are left out."""
+    slopes, offsets = {}, {}
+    for r in records:
+        good = trustworthy(r.get("compounds", {}))
+        for name, p in good.items():
+            slopes.setdefault(name, []).append(p["slope_s_per_lap"])
+            if "MEDIUM" in good:
+                offsets.setdefault(name, []).append(
+                    p["intercept_s"] - good["MEDIUM"]["intercept_s"])
+    med = lambda d: {n: float(np.median(v)) for n, v in d.items() if len(v) >= MIN_RACES_TO_BORROW}
+    return med(slopes), med(offsets)
+
+
+def borrow_missing(records: list[dict]) -> list[dict]:
+    """For each race with exactly one trustworthy compound, borrow the other
+    dry compounds from the season and simulate. Returns new records (the
+    originals are not modified)."""
+    slopes, offsets = season_medians(records)
+    new = []
+    for r in records:
+        good = trustworthy(r.get("compounds", {}))
+        if r["status"] != "skipped" or len(good) != 1:
+            continue
+        anchor, own = next(iter(good.items()))
+        if anchor not in offsets:
+            logger.warning("%s: can't borrow, no season pace offset for %s", r["race"], anchor)
+            continue
+        borrowed = {
+            c: {"intercept_s": round(own["intercept_s"] - offsets[anchor] + offsets[c], 3),
+                "slope_s_per_lap": round(slopes[c], 4)}
+            for c in DRY_COMPOUNDS - {anchor} if c in slopes and c in offsets
+        }
+        if not borrowed:
+            logger.warning("%s: can't borrow, not enough season data", r["race"])
+            continue
+        best = find_best_strategy({anchor: own, **borrowed}, r["total_laps"])
+        logger.info("%s: borrowed %s -> %s->%s @ lap %d", r["race"], sorted(borrowed),
+                    best["compound_1"], best["compound_2"], best["pit_lap"])
+        rec = {k: v for k, v in r.items() if k != "reason"}
+        new.append({**rec, "status": "ok", "borrowed": borrowed, "best_strategy": best})
+    return new
+
+
+def fill_borrowed(year: int) -> None:
+    """Reads the results log, and appends a borrowed-compound result for every
+    race that only had one trustworthy compound."""
+    log_path = EXPERIMENTS_DIR / "race_results.jsonl"
+    latest = {}
+    with open(log_path) as f:
+        for line in f:
+            r = json.loads(line)
+            if r["year"] == year:
+                latest[r["race"]] = r  # a later line replaces an earlier one
+    with open(log_path, "a") as f:
+        for rec in borrow_missing(list(latest.values())):
+            f.write(json.dumps(rec) + "\n")
+
+
 def run_all(year: int, only: list[str], skip: list[str]) -> None:
     races = get_race_names(year)
     if only:
@@ -120,6 +194,7 @@ def run_all(year: int, only: list[str], skip: list[str]) -> None:
         with open(log_path, "a") as f:
             f.write(json.dumps({"year": year, **result}) + "\n")
 
+    fill_borrowed(year)
     logger.info("Done. Run `python -m pipeline.summarize_results` for the season table.")
 
 
@@ -135,6 +210,14 @@ if __name__ == "__main__":
         help="Exact FastF1 race names to skip. Monaco is skipped by default -- "
              "special two-stop rule, not comparable strategy dynamics.",
     )
+    parser.add_argument(
+        "--borrow-only", action="store_true",
+        help="Don't run any races; just fill in borrowed-compound results from "
+             "the existing race_results.jsonl.",
+    )
     args = parser.parse_args()
 
-    run_all(args.year, args.race, args.skip)
+    if args.borrow_only:
+        fill_borrowed(args.year)
+    else:
+        run_all(args.year, args.race, args.skip)
