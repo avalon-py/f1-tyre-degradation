@@ -83,7 +83,7 @@ def run_one_race(year: int, race: str) -> dict:
     if reason:
         return {**record, "status": "skipped", "reason": reason}
 
-    cleaned = clean_laps(laps, total_laps)
+    cleaned = clean_laps(laps, total_laps, laps.attrs.get("track_status"))
     degradation = fit_degradation(cleaned, race_label=f"{year} {race}")
     log_result(race, year, degradation)
     record["compounds"] = degradation

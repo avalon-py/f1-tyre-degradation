@@ -24,11 +24,12 @@ CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
 RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
 
 
-def load_race_laps(year: int, race: str, session_type: str = "R") -> pd.DataFrame:
+def load_race_laps(year: int, race: str, session_type: str = "R") -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Load lap-level data for one session. Returns FastF1's laps DataFrame
-    with driver, lap time, compound, tyre life, pit flags, and track status
-    already attached -- no telemetry pulled, this stays lap-level by design.
+    Load lap-level data for one session.
+
+    Returns (laps, track_status). track_status holds the SC / VSC / red-flag
+    start and end times, needed to drop restart laps for every driver.
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     fastf1.Cache.enable_cache(str(CACHE_DIR))
@@ -39,17 +40,22 @@ def load_race_laps(year: int, race: str, session_type: str = "R") -> pd.DataFram
     laps = session.laps.copy()
     laps["Year"] = year
     laps["Race"] = race
+    track_status = session.track_status.copy()
 
     logger.info("Loaded %d laps for %s %s %s", len(laps), year, race, session_type)
-    return laps
+    return laps, track_status
 
 
-def save_raw(laps: pd.DataFrame, year: int, race: str) -> Path:
+def save_raw(laps: pd.DataFrame, track_status: pd.DataFrame, year: int, race: str) -> Path:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = RAW_DIR / f"{year}_{race.replace(' ', '_')}_laps.parquet"
-    laps.to_parquet(out_path, index=False)
-    logger.info("Saved raw laps to %s", out_path)
-    return out_path
+    stem = f"{year}_{race.replace(' ', '_')}"
+    laps_path = RAW_DIR / f"{stem}_laps.parquet"
+    status_path = RAW_DIR / f"{stem}_track_status.parquet"
+
+    laps.to_parquet(laps_path, index=False)
+    track_status.to_parquet(status_path, index=False)
+    logger.info("Saved raw laps to %s and track status to %s", laps_path, status_path)
+    return laps_path
 
 
 def check_race_quality(laps: pd.DataFrame) -> dict:
@@ -58,6 +64,7 @@ def check_race_quality(laps: pd.DataFrame) -> dict:
     project -- run this BEFORE spending a day analyzing a messy race.
     """
     track_status = laps["TrackStatus"].astype(str)
+    # Per-lap TrackStatus concatenates codes ("12", "124"): green means ONLY "1".
     pct_green = (track_status == "1").mean()
     compounds_used = laps["Compound"].dropna().unique().tolist()
     rainfall = laps.get("Rainfall")
@@ -77,8 +84,8 @@ if __name__ == "__main__":
     parser.add_argument("--session", type=str, default="R")
     args = parser.parse_args()
 
-    laps = load_race_laps(args.year, args.race, args.session)
-    save_raw(laps, args.year, args.race)
+    laps, track_status = load_race_laps(args.year, args.race, args.session)
+    save_raw(laps, track_status, args.year, args.race)
 
     quality = check_race_quality(laps)
     logger.info("Quality check: %s", quality)

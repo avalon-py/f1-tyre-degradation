@@ -48,15 +48,75 @@ DRY_COMPOUNDS = {"SOFT", "MEDIUM", "HARD"}
 # 1 = green flag. Everything else gets dropped for degradation fitting.
 NON_GREEN_STATUS_CODES = {"2", "4", "5", "6", "7"}  # yellow, SC, red, VSC, VSC ending
 
+# FastF1's per-lap TrackStatus is a STRING OF CONCATENATED CODES for every
+# status that was active at any point during the lap: "1", "12", "124",
+# "267"... An exact-match test against single codes misses every lap that
+# mixed green with yellow/SC/VSC, so test for *any* bad character instead.
+_NON_GREEN_RE = "[" + "".join(sorted(NON_GREEN_STATUS_CODES)) + "]"
 
-def clean_laps(laps: pd.DataFrame, total_laps: int) -> pd.DataFrame:
+# Status codes that, when followed by green ("1"), mean "the field just got
+# released": SC, red flag, VSC, VSC ending.
+_RESTART_FROM = {"4", "5", "6", "7"}
+
+# Laps dropped per driver after green is shown: the lap that contains the
+# restart itself, plus this many after it (bunched field, cold tyres and
+# brakes, fuel-saving, gaps being closed up).
+RESTART_LAPS_AFTER = 1
+
+# Slow-lap filter: traffic, lapped cars, off-track moments and leftover
+# yellows aren't tyre wear. Same idea as FastF1's pick_quicklaps: drop laps
+# slower than this multiple of the race's fastest remaining lap.
+SLOW_LAP_FACTOR = 1.07
+
+
+def restart_lap_mask(laps: pd.DataFrame, track_status: pd.DataFrame,
+                     n_after: int = RESTART_LAPS_AFTER) -> pd.Series:
+    """
+    True for laps that should be dropped because they contain, or directly
+    follow, a restart to green after an SC / VSC / red flag -- for EVERY
+    driver on track at that moment, including those who stayed out (which
+    a per-driver TyreLife filter can't catch).
+
+    `track_status` is FastF1's `session.track_status` (columns Time, Status)
+    saved by ingestion. Needs laps' LapStartTime, Time, Driver, LapNumber.
+    """
+    bad = pd.Series(False, index=laps.index)
+    ts = track_status.sort_values("Time")
+    status = ts["Status"].astype(str).tolist()
+    times = ts["Time"].tolist()
+    restarts = [t for prev, cur, t in zip(status, status[1:], times[1:])
+                if cur == "1" and prev in _RESTART_FROM]
+    if not restarts or "LapStartTime" not in laps or "Time" not in laps:
+        return bad
+    for t in restarts:
+        containing = laps[(laps["LapStartTime"] <= t) & (laps["Time"] > t)]
+        for driver, g in containing.groupby("Driver"):
+            n = int(g["LapNumber"].iloc[0])
+            bad |= (laps["Driver"] == driver) & laps["LapNumber"].between(n, n + n_after)
+    return bad
+
+
+def clean_laps(laps: pd.DataFrame, total_laps: int,
+               track_status: pd.DataFrame | None = None,
+               slow_lap_factor: float | None = SLOW_LAP_FACTOR,
+               restart_laps_after: int = RESTART_LAPS_AFTER) -> pd.DataFrame:
     df = laps.copy()
     n_start = len(df)
 
+    # Restart laps have to be flagged on the FULL lap table, before the other
+    # filters remove rows, because they're defined by lap number per driver.
+    if track_status is not None and len(track_status):
+        df = df[~restart_lap_mask(df, track_status, restart_laps_after)]
+    if "Deleted" in df.columns:
+        df = df[~df["Deleted"].fillna(False).astype(bool)]   # stewards deleted the time
+
     df = df[df["Compound"].isin(DRY_COMPOUNDS)]
     df = df[df["PitInTime"].isna() & df["PitOutTime"].isna()]
-    df = df[~df["TrackStatus"].astype(str).isin(NON_GREEN_STATUS_CODES)]
+    df = df[~df["TrackStatus"].astype(str).str.contains(_NON_GREEN_RE, regex=True)]
     df = df[df["LapTime"].notna()]
+    if slow_lap_factor:
+        secs = df["LapTime"].dt.total_seconds()
+        df = df[secs <= slow_lap_factor * secs.min()]
 
     # Drop the first two laps of every stint (TyreLife <= 2), not just the
     # race's opening lap. FastF1's TyreLife counts the out-lap itself as
@@ -110,9 +170,14 @@ if __name__ == "__main__":
 
     raw_path = RAW_DIR / f"{args.year}_{args.race.replace(' ', '_')}_laps.parquet"
     laps = pd.read_parquet(raw_path)
+    ts_path = raw_path.with_name(raw_path.name.replace("_laps.", "_track_status."))
+    track_status = pd.read_parquet(ts_path) if ts_path.exists() else None
+    if track_status is None:
+        logger.warning("No %s -- SC/VSC restart laps will NOT be dropped. "
+                       "Re-run ingestion.load_session to save it.", ts_path.name)
 
     total_laps = args.total_laps or int(laps["LapNumber"].max())
-    cleaned = clean_laps(laps, total_laps)
+    cleaned = clean_laps(laps, total_laps, track_status)
 
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     out_path = PROCESSED_DIR / f"{args.year}_{args.race.replace(' ', '_')}_clean.parquet"
