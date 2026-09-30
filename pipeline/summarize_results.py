@@ -1,54 +1,44 @@
 """
-Reads experiments/degradation_results.jsonl (built up by run_all_races.py)
-and prints one row per race/compound -- the season-wide view. Run this
-after a batch run to see whether Bahrain's findings (weak SOFT signal,
-track-evolution confound) are circuit-specific or a general pattern.
+Reads experiments/race_results.jsonl (built by run_all_races.py) and prints
+one row per race: its lap count, fuel effect, tyre slopes per compound, and
+the simulated best strategy (or why the race was skipped).
 
 Usage:
     python -m pipeline.summarize_results
 """
 
 import json
-import logging
 from pathlib import Path
 
 import pandas as pd
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
-
 EXPERIMENTS_DIR = Path(__file__).resolve().parent.parent / "experiments"
 
 
-def load_all_results() -> pd.DataFrame:
-    log_path = EXPERIMENTS_DIR / "degradation_results.jsonl"
-    rows = []
-    with open(log_path) as f:
+def load_latest_per_race() -> pd.DataFrame:
+    rows = {}
+    with open(EXPERIMENTS_DIR / "race_results.jsonl") as f:
         for line in f:
-            entry = json.loads(line)
-            for compound, params in entry["compounds"].items():
-                rows.append({"year": entry["year"], "race": entry["race"], "compound": compound, **params})
-    return pd.DataFrame(rows)
+            r = json.loads(line)
+            rows[(r["year"], r["race"])] = r  # a re-run replaces the earlier row
+
+    table = []
+    for r in rows.values():
+        compounds = r.get("compounds", {})
+        best = r.get("best_strategy")
+        table.append({
+            "race": r["race"],
+            "laps": r.get("total_laps"),
+            "fuel_s/lap": r.get("fuel_s_per_lap"),
+            **{f"{c[0]}_slope": compounds[c]["slope_s_per_lap"] if c in compounds else None
+               for c in ("SOFT", "MEDIUM", "HARD")},
+            "best": (f"{best['compound_1']}->{best['compound_2']} @ lap {best['pit_lap']}"
+                     if best else f"[{r['status']}] {r.get('reason', '')}"),
+        })
+    return pd.DataFrame(table)
 
 
 if __name__ == "__main__":
-    df = load_all_results()
-
-    # keep only the latest fit per (race, compound) in case a race was re-run
-    df = df.drop_duplicates(subset=["year", "race", "compound"], keep="last")
-
-    summary = df[[
-        "race", "compound", "slope_s_per_lap", "pct_stints_positive_slope",
-        "n_stints_used", "max_observed_tyre_life",
-    ]].sort_values(["race", "compound"])
-
     pd.set_option("display.max_rows", None)
-    print(summary.to_string(index=False))
-
-    unreliable = summary[summary["pct_stints_positive_slope"] < 0.4]
-    logger.info(
-        "%d of %d race/compound fits fall below the 40%% reliability threshold "
-        "used by models.simulate -- these are the ones worth a closer look, same "
-        "way Bahrain HARD was diagnosed.",
-        len(unreliable), len(summary),
-    )
+    pd.set_option("display.width", 200)
+    print(load_latest_per_race().to_string(index=False))

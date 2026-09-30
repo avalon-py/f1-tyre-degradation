@@ -9,7 +9,7 @@ against what teams actually did.
 | Area | State |
 |---|---|
 | Ingestion (`ingestion/load_session.py`) | Built. Pulls lap-level data via FastF1, caches to disk, flags race quality (green-flag %, compounds used) before committing to a race. |
-| Cleaning (`features/clean.py`) | Built. Drops in/out laps, non-green-flag laps, missing-compound laps; applies a flat fuel correction. |
+| Cleaning (`features/clean.py`) | Built. Drops in/out laps, non-green-flag laps, non-dry-compound laps; applies a per-race fuel correction (from the race's lap count). |
 | Degradation fit (`models/degradation.py`) | Built. One linear regression per driver-stint, averaged (median) per compound per race. Logged to `experiments/degradation_results.jsonl`. |
 | Strategy simulator (`models/simulate.py`) | Built. Brute-force search over compound pairs and pit lap; auto-excludes compounds with unreliable degradation fits. No safety car / traffic model yet -- see Roadmap. |
 | Validation against real races | Not yet built -- Day 5 (see Roadmap). |
@@ -41,7 +41,7 @@ FastF1 API ──► ingestion/load_session.py ──► data/raw/*.parquet
                         (brute-force search, fastest pit lap + compounds)
 ```
 
-`pipeline/run_pipeline.py` chains all four steps for one race.
+`pipeline/run_all_races.py` chains all four steps for every race in a season (or one race with `--race`), giving each race its own fuel effect and tyre parameters.
 
 ## Data
 
@@ -57,10 +57,11 @@ circuit -- a "medium" at one track isn't the same physical tyre as a
 
 ## Known limitations
 
-- **Fuel correction is a flat 0.03s/lap estimate**, not measured from this
-  data. It's a starting assumption -- worth revisiting once degradation
-  fits look stable, since an overcorrected or undercorrected fuel term
-  would bias the slope.
+- **Fuel effect is an estimate, not measured from this data.** It is
+  `110 kg / race laps * 0.03 s/kg` per race (~0.058 s/lap at Bahrain's 57
+  laps, ~0.075 at Spa's 44). Both constants are educated guesses -- worth
+  revisiting once degradation fits look stable, since an overcorrected or
+  undercorrected fuel term would bias the slope.
 - **Pit loss (22s) is a rough constant**, not race-specific. Should be
   measured from actual in-lap/out-lap deltas per circuit.
 - **No safety car or traffic modeling.** The simulator assumes a clean,
@@ -89,14 +90,9 @@ circuit -- a "medium" at one track isn't the same physical tyre as a
   driver on track at that moment, not by each driver's own `TyreLife`.
   Not implemented -- this is a real, specific, remaining gap, not
   something the current filter accidentally handles.
-- **Two circuits have a literal `"nan"`/`"None"` string in
-  `compounds_used`** (Miami, Belgian GP per the season-wide batch run).
-  `clean.py`'s filter (`df["Compound"].notna()`) only catches real
-  null/NaN objects -- if FastF1 is returning the *string* `"None"` rather
-  than an actual null for some laps, that filter silently does nothing and
-  those rows would leak into a compound's fit as garbage. Flagged, not yet
-  confirmed or fixed -- worth checking before trusting Miami/Belgian's
-  degradation numbers.
+- ~~Literal `"nan"`/`"None"` compound strings (Miami, Belgian GP)~~ --
+  fixed: `clean.py` now keeps only SOFT/MEDIUM/HARD laps (an allow-list),
+  so stray strings and intermediate/wet tyres are dropped.
 - **Bahrain 2025 HARD compound is excluded from the simulation** (see
   `models/simulate.py::load_degradation`). All 14 HARD stints in this race
   were confounded: some started right at the lap-32 safety car restart
@@ -124,14 +120,13 @@ pip install -r requirements.txt
 
 ```bash
 python -m ingestion.load_session --year 2025 --race Bahrain      # 1. pull + cache raw laps
-python -m features.clean --year 2025 --race Bahrain              # 2. clean + fuel-correct
+python -m features.clean --year 2025 --race Bahrain              # 2. clean + fuel-correct (per-race, from lap count)
 python -m models.degradation --year 2025 --race Bahrain          # 3. fit degradation curves
 python -m models.simulate --year 2025 --race Bahrain --total-laps 57   # 4. find best strategy
 
-# or run all four in one go:
-python -m pipeline.run_pipeline --year 2025 --race Bahrain --total-laps 57
-
-# or run ingestion->clean->degradation across the whole 2025 calendar:
+# or run all four in one go, for one race or the whole 2025 calendar
+# (total laps are read from the data; wet/too-messy races are skipped with a reason):
+python -m pipeline.run_all_races --year 2025 --race Bahrain
 python -m pipeline.run_all_races --year 2025
 python -m pipeline.summarize_results
 ```
@@ -154,7 +149,7 @@ direction -- data exists, just noisy; overridable via
 `--min-pct-positive`).
 
 Run `pytest` for the test suite. Coverage is currently uneven: thorough
-for `features/clean.py` (7 tests covering the lap-filtering and fuel-
+for `features/clean.py` (9 tests covering the lap-filtering and fuel-
 correction logic), but `models/degradation.py` and `models/simulate.py`
 have real branching logic (median-vs-mean, the reliability threshold, the
 `--compounds` error paths) with no tests yet -- a known gap, not an
@@ -224,7 +219,7 @@ involve.
    Found three concrete gaps: extrapolation beyond observed stint length
    (now auto-flagged), a track-evolution/compound confound in the SOFT vs
    MEDIUM comparison, and no support for safety-car-created extra stops.
-6. **Run ingestion + cleaning + degradation across the full 2025 calendar**
+6. **Run the full chain across the 2025 calendar**
    (`pipeline/run_all_races.py`, then `pipeline/summarize_results.py` for
    the season table) to check whether the track-evolution confound and
    weak degradation signal seen at Bahrain are Bahrain-specific or
@@ -250,9 +245,8 @@ involve.
 ingestion/    load_session.py -- FastF1 pull + cache + quality check
 features/     clean.py -- filtering + fuel correction
 models/       degradation.py (per-compound fit), simulate.py (strategy search)
-pipeline/     run_pipeline.py (single race, full chain incl. simulate)
-              run_all_races.py (full 2025 calendar, ingestion->clean->degradation only)
-              summarize_results.py (season-wide table from the batch run)
+pipeline/     run_all_races.py (full chain incl. simulate, per race; --race for one)
+              summarize_results.py (season-wide table from race_results.jsonl)
 config/       races.json -- season, race list, compound-labeling notes
 experiments/  degradation_results.jsonl -- one line per race fit
 tests/        test_clean.py

@@ -23,8 +23,7 @@ PROCESSED_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
 EXPERIMENTS_DIR = Path(__file__).resolve().parent.parent / "experiments"
 
 
-MIN_LAPS_PER_STINT = 6  # raised from 4 -- a slope fit on 4-5 laps is too easily
-                          # swung by a single noisy lap (traffic, small error)
+MIN_LAPS_PER_STINT = 4
 
 
 def _fit_one_stint(group: pd.DataFrame) -> dict | None:
@@ -89,10 +88,6 @@ def fit_degradation(cleaned: pd.DataFrame, race_label: str = "") -> dict:
         slopes = np.array([f["slope_s_per_lap"] for f in stint_fits])
         intercepts = np.array([f["intercept_s"] for f in stint_fits])
 
-        # Median, not mean -- per-stint slopes are heavy-tailed (a single
-        # messy stint can swing a mean far more than it should). Mean is
-        # still reported for comparison/transparency, since a mean vs.
-        # median gap is itself a useful "how skewed is this" signal.
         max_tyre_life = int(compound_group["TyreLife"].max())
 
         results[compound] = {
@@ -103,10 +98,6 @@ def fit_degradation(cleaned: pd.DataFrame, race_label: str = "") -> dict:
             "n_stints_used": len(stint_fits),
             "n_laps": int(sum(f["n_laps"] for f in stint_fits)),
             "pct_stints_positive_slope": round(float((slopes > 0).mean()), 3),
-            # Longest stint actually observed on this compound. The linear
-            # fit is only trustworthy up to here -- beyond it, the
-            # simulator is extrapolating past any real data (tyres can
-            # fall off a cliff well before a linear model would predict).
             "max_observed_tyre_life": max_tyre_life,
         }
         logger.info(

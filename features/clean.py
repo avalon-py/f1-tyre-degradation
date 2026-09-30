@@ -2,11 +2,11 @@
 Clean raw lap data into something a degradation model can trust.
 
 Drops: in-laps, out-laps, laps under safety car / VSC / red flag, and laps
-with no recorded compound. Applies a linear fuel-load correction so laps
+not on a dry compound (SOFT / MEDIUM / HARD). Applies a linear fuel-load correction so laps
 aren't confounded by the car getting lighter over the race.
 
 Usage:
-    python -m features.clean --year 2025 --race Bahrain
+    python -m features.clean --year 2025 --race Bahrain [--total-laps 57]
 """
 
 import argparse
@@ -21,22 +21,39 @@ logger = logging.getLogger(__name__)
 RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
 PROCESSED_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
 
-# Seconds gained per lap from fuel burn-off. Rough estimate -- ~110kg of fuel
-# burned over a race at roughly 0.03s/lap/10kg. Treat as a starting
-# assumption, not ground truth; revisit once you have degradation fits and
-# can sanity-check the slope.
-FUEL_CORRECTION_S_PER_LAP = 0.03
+# Fuel effect, per race. Fuel burned per lap is (start fuel / race laps), so a
+# race with fewer laps (Spa, 44) burns more per lap than one with more
+# (Monaco, 78). Race distance is ~305 km everywhere, so laps is effectively
+# the inverse of circuit length.
+#
+# Both constants are educated guesses, not measured values:
+#   - 110 kg is the regulation maximum; teams often start a little under it.
+#   - ~0.03 s/kg is the commonly quoted lap-time cost of fuel mass.
+# Assumes linear burn and ignores per-circuit consumption differences.
+START_FUEL_KG = 110.0
+FUEL_S_PER_KG = 0.03
+
+
+def fuel_s_per_lap(total_laps: int) -> float:
+    """Seconds of lap time gained per lap from fuel burn-off in this race."""
+    return START_FUEL_KG / total_laps * FUEL_S_PER_KG
+
+
+# Only dry compounds are modelled. This is an allow-list rather than a
+# notna() check because FastF1 sometimes gives the strings "nan" / "None" /
+# "UNKNOWN", which notna() lets straight through.
+DRY_COMPOUNDS = {"SOFT", "MEDIUM", "HARD"}
 
 # Track status codes that mean "not a clean racing lap" per FastF1's docs.
 # 1 = green flag. Everything else gets dropped for degradation fitting.
 NON_GREEN_STATUS_CODES = {"2", "4", "5", "6", "7"}  # yellow, SC, red, VSC, VSC ending
 
 
-def clean_laps(laps: pd.DataFrame) -> pd.DataFrame:
+def clean_laps(laps: pd.DataFrame, total_laps: int) -> pd.DataFrame:
     df = laps.copy()
     n_start = len(df)
 
-    df = df[df["Compound"].notna()]
+    df = df[df["Compound"].isin(DRY_COMPOUNDS)]
     df = df[df["PitInTime"].isna() & df["PitOutTime"].isna()]
     df = df[~df["TrackStatus"].astype(str).isin(NON_GREEN_STATUS_CODES)]
     df = df[df["LapTime"].notna()]
@@ -72,11 +89,14 @@ def clean_laps(laps: pd.DataFrame) -> pd.DataFrame:
     # we need to undo that fuel-driven speedup -- so LATER laps get MORE
     # time added back, bringing them up to what they'd have run on a full
     # tank. Anchored so lap 1 gets ~0 correction.
-    df["LapTimeCorrected"] = df["LapTimeSeconds"] + FUEL_CORRECTION_S_PER_LAP * (
+    df["LapTimeCorrected"] = df["LapTimeSeconds"] + fuel_s_per_lap(total_laps) * (
         df["LapNumber"] - 1
     )
 
-    logger.info("Cleaned %d -> %d laps (%.0f%% kept)", n_start, len(df), 100 * len(df) / n_start)
+    logger.info(
+        "Cleaned %d -> %d laps (%.0f%% kept); fuel effect %.4f s/lap over %d laps",
+        n_start, len(df), 100 * len(df) / n_start, fuel_s_per_lap(total_laps), total_laps,
+    )
     return df.reset_index(drop=True)
 
 
@@ -84,12 +104,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--year", type=int, default=2025)
     parser.add_argument("--race", type=str, required=True)
+    parser.add_argument("--total-laps", type=int, default=None,
+                        help="Race laps (default: winner's lap count from the data)")
     args = parser.parse_args()
 
     raw_path = RAW_DIR / f"{args.year}_{args.race.replace(' ', '_')}_laps.parquet"
     laps = pd.read_parquet(raw_path)
 
-    cleaned = clean_laps(laps)
+    total_laps = args.total_laps or int(laps["LapNumber"].max())
+    cleaned = clean_laps(laps, total_laps)
 
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     out_path = PROCESSED_DIR / f"{args.year}_{args.race.replace(' ', '_')}_clean.parquet"

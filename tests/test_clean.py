@@ -5,7 +5,7 @@ Basic sanity tests for the cleaning pipeline. Run with: pytest
 import pandas as pd
 import pytest
 
-from features.clean import clean_laps
+from features.clean import clean_laps, fuel_s_per_lap
 
 
 def make_fake_laps():
@@ -24,25 +24,25 @@ def make_fake_laps():
 
 def test_drops_missing_compound():
     laps = make_fake_laps()
-    cleaned = clean_laps(laps)
+    cleaned = clean_laps(laps, total_laps=57)
     assert cleaned["Compound"].notna().all()
 
 
 def test_drops_non_green_flag_laps():
     laps = make_fake_laps()
-    cleaned = clean_laps(laps)
+    cleaned = clean_laps(laps, total_laps=57)
     assert (cleaned["TrackStatus"].astype(str) == "2").sum() == 0
 
 
 def test_drops_pit_laps():
     laps = make_fake_laps()
-    cleaned = clean_laps(laps)
+    cleaned = clean_laps(laps, total_laps=57)
     assert cleaned["PitInTime"].isna().all()
 
 
 def test_drops_lap_one():
     laps = make_fake_laps()
-    cleaned = clean_laps(laps)
+    cleaned = clean_laps(laps, total_laps=57)
     assert (cleaned["LapNumber"] == 1).sum() == 0
 
 
@@ -52,7 +52,7 @@ def test_drops_tyre_life_two_as_well():
     # restart -- is the first FLYING lap, TyreLife==2. That must be dropped
     # explicitly, since it isn't a pit lap and isn't flagged by track status.
     laps = make_fake_laps()
-    cleaned = clean_laps(laps)
+    cleaned = clean_laps(laps, total_laps=57)
     assert (cleaned["TyreLife"] <= 2).sum() == 0
 
 
@@ -67,13 +67,13 @@ def test_drops_restart_flying_lap_mid_race():
         "LapNumber": 35, "TyreLife": 2,
     }])
     laps = pd.concat([laps, restart_row], ignore_index=True)
-    cleaned = clean_laps(laps)
+    cleaned = clean_laps(laps, total_laps=57)
     assert (cleaned["LapNumber"] == 35).sum() == 0
 
 
 def test_fuel_correction_increases_later_laps_more():
     laps = make_fake_laps()
-    cleaned = clean_laps(laps)
+    cleaned = clean_laps(laps, total_laps=57)
     # Lap 7 (lighter on fuel, ran unfairly fast) should get MORE time added
     # back than lap 6, to bring it up to full-tank-equivalent pace.
     lap6 = cleaned[cleaned["LapNumber"] == 6].iloc[0]
@@ -81,3 +81,21 @@ def test_fuel_correction_increases_later_laps_more():
     correction_lap6 = lap6["LapTimeCorrected"] - lap6["LapTimeSeconds"]
     correction_lap7 = lap7["LapTimeCorrected"] - lap7["LapTimeSeconds"]
     assert correction_lap7 > correction_lap6
+
+
+def test_drops_non_dry_and_string_compounds():
+    # FastF1 can give the *strings* "nan"/"None", which notna() would keep.
+    laps = make_fake_laps()
+    extra = pd.DataFrame([
+        {"Compound": c, "PitInTime": pd.NaT, "PitOutTime": pd.NaT, "TrackStatus": "1",
+         "LapTime": pd.to_timedelta("0:01:30"), "LapNumber": 20 + i, "TyreLife": 5}
+        for i, c in enumerate(["nan", "None", "INTERMEDIATE", "UNKNOWN"])
+    ])
+    cleaned = clean_laps(pd.concat([laps, extra], ignore_index=True), total_laps=57)
+    assert set(cleaned["Compound"]) <= {"SOFT", "MEDIUM", "HARD"}
+    assert (cleaned["LapNumber"] >= 20).sum() == 0
+
+
+def test_fewer_laps_means_bigger_fuel_effect():
+    # Same fuel spread over fewer laps (Spa-like) burns more per lap.
+    assert fuel_s_per_lap(44) > fuel_s_per_lap(57) > fuel_s_per_lap(78)
