@@ -1,0 +1,18 @@
+{
+  "season": 2025,
+  "primary_race": {
+    "name": "Bahrain",
+    "session": "R",
+    "note": "Main race for Days 1-5. Confirm dry/green-flag via ingestion.check_race_quality before committing."
+  },
+  "generalization_races": [
+    {"name": "Hungary", "session": "R"},
+    {"name": "Spain", "session": "R"}
+  ],
+  "excluded": {
+    "Monaco": "special two-stop rule, minimal overtaking, not comparable strategy dynamics"
+  },
+  "compound_labels": {
+    "note": "Model relative compounds (SOFT/MEDIUM/HARD) per race, never absolute C1-C5. Pirelli's compound choice differs by circuit, so 'medium' at one track is not the same tyre as 'medium' at another."
+  }
+}

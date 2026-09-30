@@ -54,7 +54,7 @@ def stint_slopes_for_compound(cleaned: pd.DataFrame, compound: str) -> pd.DataFr
     return pd.DataFrame(rows).sort_values("slope_s_per_lap")
 
 
-def fit_degradation(cleaned: pd.DataFrame) -> dict:
+def fit_degradation(cleaned: pd.DataFrame, race_label: str = "") -> dict:
     """
     Returns, per compound: mean intercept and slope across individual
     driver-stints, not one pooled regression across all drivers. Pooling
@@ -64,7 +64,13 @@ def fit_degradation(cleaned: pd.DataFrame) -> dict:
     clean positive degradation. Fitting per stint and averaging avoids
     that confound. n_stints_used tells you how many stints had enough
     laps (>=4) to fit; n_laps is the total laps behind those stints.
+
+    race_label is purely for logging -- makes log lines identifiable when
+    running across many races in a batch (see pipeline.run_all_races),
+    where a bare "HARD: 90.06s base..." with no race name is unreadable
+    once you're 15 races into a season-wide run.
     """
+    prefix = f"[{race_label}] " if race_label else ""
     results = {}
     for compound, compound_group in cleaned.groupby("Compound"):
         stint_fits = []
@@ -75,7 +81,8 @@ def fit_degradation(cleaned: pd.DataFrame) -> dict:
 
         if len(stint_fits) < 3:
             logger.warning(
-                "Skipping %s: only %d fittable stints, too few to average", compound, len(stint_fits)
+                "%sSkipping %s: only %d fittable stints, too few to average",
+                prefix, compound, len(stint_fits)
             )
             continue
 
@@ -103,9 +110,9 @@ def fit_degradation(cleaned: pd.DataFrame) -> dict:
             "max_observed_tyre_life": max_tyre_life,
         }
         logger.info(
-            "%s: %.3fs base + %.4fs/lap degradation [median] (mean=%.4f, std=%.4f, "
+            "%s%s: %.3fs base + %.4fs/lap degradation [median] (mean=%.4f, std=%.4f, "
             "stints=%d, n_laps=%d, %.0f%% of stints positive)",
-            compound, results[compound]["intercept_s"], results[compound]["slope_s_per_lap"],
+            prefix, compound, results[compound]["intercept_s"], results[compound]["slope_s_per_lap"],
             results[compound]["slope_mean"], results[compound]["slope_std"],
             results[compound]["n_stints_used"],
             results[compound]["n_laps"], 100 * results[compound]["pct_stints_positive_slope"],
@@ -131,5 +138,5 @@ if __name__ == "__main__":
     path = PROCESSED_DIR / f"{args.year}_{args.race.replace(' ', '_')}_clean.parquet"
     cleaned = pd.read_parquet(path)
 
-    results = fit_degradation(cleaned)
+    results = fit_degradation(cleaned, race_label=f"{args.year} {args.race}")
     log_result(args.race, args.year, results)

@@ -28,7 +28,8 @@ EXPERIMENTS_DIR = Path(__file__).resolve().parent.parent / "experiments"
 PIT_LOSS_SECONDS = 22.0
 
 
-def load_degradation(race: str, year: int, min_pct_positive: float = 0.5) -> dict:
+def load_degradation(race: str, year: int, min_pct_positive: float = 0.5,
+                      required_compounds: list | None = None) -> dict:
     """
     Pulls the most recent fit for this race from the degradation log.
     Drops any compound whose pct_stints_positive_slope is below
@@ -44,6 +45,27 @@ def load_degradation(race: str, year: int, min_pct_positive: float = 0.5) -> dic
     stints clustered at exactly those two situations, so there's no clean
     subsample left in this race to fit HARD degradation from. Revisit once
     a race is added (Day 6) where HARD is used mid-race under green flag.
+
+    required_compounds: if given (e.g. a user explicitly wants to compare
+    SOFT at this circuit), any compound in this list that isn't usable
+    raises a clear, specific error instead of the default behavior, which
+    is to silently drop unreliable compounds and proceed with whatever's
+    left. Two distinct failure reasons are surfaced separately, because
+    they mean different things:
+      - NEVER FIT: the compound doesn't appear in the degradation log at
+        all for this race -- there weren't enough long enough stints
+        (>=3 stints of >=6 laps) to fit a slope from. Common for compounds
+        only used for a short opening stint (see e.g. several 2025 races
+        where SOFT never got fit). No amount of threshold-tuning fixes
+        this -- the underlying laps to fit from don't exist.
+      - BELOW RELIABILITY THRESHOLD: the compound WAS fit, but most
+        individual stints disagreed on direction (see Bahrain HARD above).
+        This one *can* be overridden by lowering min_pct_positive, since
+        the data exists -- it's just noisy or confounded.
+    Without required_compounds, both cases are just logged and skipped, as
+    before -- that's the right default for "find me the best strategy from
+    whatever's trustworthy," but the wrong default for "specifically tell
+    me what happens if I use SOFT here."
     """
     log_path = EXPERIMENTS_DIR / "degradation_results.jsonl"
     latest = None
@@ -55,8 +77,9 @@ def load_degradation(race: str, year: int, min_pct_positive: float = 0.5) -> dic
     if latest is None:
         raise ValueError(f"No degradation fit found for {race} {year}. Run models.degradation first.")
 
+    all_fit = latest["compounds"]
     compounds = {}
-    for name, params in latest["compounds"].items():
+    for name, params in all_fit.items():
         pct_positive = params.get("pct_stints_positive_slope", 1.0)
         if pct_positive < min_pct_positive:
             logger.warning(
@@ -66,6 +89,25 @@ def load_degradation(race: str, year: int, min_pct_positive: float = 0.5) -> dic
             )
             continue
         compounds[name] = params
+
+    if required_compounds:
+        for name in required_compounds:
+            if name not in all_fit:
+                raise ValueError(
+                    f"Cannot simulate {name} at {race} {year}: it was never fit -- no "
+                    f"compound with enough long stints to model degradation from. This "
+                    f"circuit/race simply doesn't have usable {name} data, not a threshold "
+                    f"issue. Compounds that WERE fit here: {list(all_fit.keys())}."
+                )
+            if name not in compounds:
+                pct = all_fit[name]["pct_stints_positive_slope"]
+                raise ValueError(
+                    f"Cannot simulate {name} at {race} {year}: only {100*pct:.0f}% of its "
+                    f"stints showed positive degradation (below the {100*min_pct_positive:.0f}% "
+                    f"threshold), so the fit isn't trustworthy. Data exists but is noisy/"
+                    f"confounded -- pass a lower --min-pct-positive to override if you "
+                    f"understand why (see load_degradation docstring for the Bahrain HARD case)."
+                )
 
     if len(compounds) < 2:
         raise ValueError(
@@ -146,9 +188,19 @@ if __name__ == "__main__":
              "lowered from a stricter 0.5 because Bahrain 2025 showed weak "
              "degradation overall; tighten this for higher-deg circuits.",
     )
+    parser.add_argument(
+        "--compounds", type=str, nargs="*", default=None,
+        help="Force the simulation to use exactly these compounds (e.g. "
+             "--compounds SOFT HARD), instead of auto-selecting whatever's "
+             "reliable. Raises a clear error naming why a compound can't be "
+             "used (never fit, vs. fit but unreliable) rather than silently "
+             "leaving it out.",
+    )
     args = parser.parse_args()
 
-    compounds = load_degradation(args.race, args.year, args.min_pct_positive)
+    compounds = load_degradation(args.race, args.year, args.min_pct_positive, args.compounds)
+    if args.compounds:
+        compounds = {name: compounds[name] for name in args.compounds}
     logger.info("Simulating with compounds: %s", list(compounds.keys()))
 
     best = find_best_strategy(compounds, args.total_laps)

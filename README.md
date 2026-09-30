@@ -76,6 +76,27 @@ circuit -- a "medium" at one track isn't the same physical tyre as a
   every individual stint shows clean positive degradation. Median is used
   over mean because per-stint slopes are heavy-tailed; one noisy short
   stint can swing a mean far more than it should.
+- **The safety-car filter only catches drivers who pitted into the
+  restart, not everyone else on track.** `features/clean.py` drops
+  `TyreLife <= 2`, which removes a fresh-tyre stint's unrepresentative
+  opening laps -- including a stint that happens to start right at an SC
+  restart. But a driver who *stayed out* through the safety car on old
+  tyres has a high `TyreLife` at that same moment, so this filter doesn't
+  touch their lap at all, even though it's just as bunched and
+  unrepresentative as the pitted drivers' laps. The correct fix is to drop
+  by *lap number relative to when the SC/VSC was lifted* (available via
+  FastF1's track status transitions or race control messages), for every
+  driver on track at that moment, not by each driver's own `TyreLife`.
+  Not implemented -- this is a real, specific, remaining gap, not
+  something the current filter accidentally handles.
+- **Two circuits have a literal `"nan"`/`"None"` string in
+  `compounds_used`** (Miami, Belgian GP per the season-wide batch run).
+  `clean.py`'s filter (`df["Compound"].notna()`) only catches real
+  null/NaN objects -- if FastF1 is returning the *string* `"None"` rather
+  than an actual null for some laps, that filter silently does nothing and
+  those rows would leak into a compound's fit as garbage. Flagged, not yet
+  confirmed or fixed -- worth checking before trusting Miami/Belgian's
+  degradation numbers.
 - **Bahrain 2025 HARD compound is excluded from the simulation** (see
   `models/simulate.py::load_degradation`). All 14 HARD stints in this race
   were confounded: some started right at the lap-32 safety car restart
@@ -109,9 +130,35 @@ python -m models.simulate --year 2025 --race Bahrain --total-laps 57   # 4. find
 
 # or run all four in one go:
 python -m pipeline.run_pipeline --year 2025 --race Bahrain --total-laps 57
+
+# or run ingestion->clean->degradation across the whole 2025 calendar:
+python -m pipeline.run_all_races --year 2025
+python -m pipeline.summarize_results
 ```
 
-Run `pytest` for the cleaning-logic tests.
+By default, `models.simulate` auto-selects whichever compounds passed the
+reliability check and finds the best strategy among them -- it won't tell
+you what a compound it silently excluded (or never even fit) would have
+done. To explicitly ask "what if I use SOFT here," force it with
+`--compounds`:
+
+```bash
+python -m models.simulate --year 2025 --race Bahrain --total-laps 57 --compounds SOFT MEDIUM
+```
+
+If SOFT isn't usable, this fails loudly with one of two specific reasons
+instead of just quietly leaving it out: **never fit** (not enough long
+stints existed to model it at all -- no threshold will fix this) or
+**below reliability threshold** (it was fit, but most stints disagreed on
+direction -- data exists, just noisy; overridable via
+`--min-pct-positive`).
+
+Run `pytest` for the test suite. Coverage is currently uneven: thorough
+for `features/clean.py` (7 tests covering the lap-filtering and fuel-
+correction logic), but `models/degradation.py` and `models/simulate.py`
+have real branching logic (median-vs-mean, the reliability threshold, the
+`--compounds` error paths) with no tests yet -- a known gap, not an
+oversight to assume is covered.
 
 ## Validation: model vs. real strategy (Bahrain 2025)
 
@@ -177,11 +224,18 @@ involve.
    Found three concrete gaps: extrapolation beyond observed stint length
    (now auto-flagged), a track-evolution/compound confound in the SOFT vs
    MEDIUM comparison, and no support for safety-car-created extra stops.
-6. **Repeat on 2-3 more 2025 races** (see `config/races.json`) to check
-   whether the track-evolution confound and weak degradation signal seen
-   at Bahrain are Bahrain-specific or general. Deliberately staying within
-   2025 rather than adding more seasons, to avoid reopening the
-   regulation-consistency problem Day 1 was built to avoid.
+6. **Run ingestion + cleaning + degradation across the full 2025 calendar**
+   (`pipeline/run_all_races.py`, then `pipeline/summarize_results.py` for
+   the season table) to check whether the track-evolution confound and
+   weak degradation signal seen at Bahrain are Bahrain-specific or
+   general. This is the cheap, automatable half of generalizing -- no new
+   judgment calls, just the existing pipeline run across every round.
+   Monaco excluded by default (special two-stop rule). Hand validation
+   (the Day 5 real-vs-model comparison) stays scoped to 2-3 races, since
+   that needs real thinking time per race and doesn't scale to a full
+   season in the time remaining. Deliberately staying within 2025 rather
+   than adding more seasons, to avoid reopening the regulation-consistency
+   problem Day 1 was built to avoid.
 7. Stretch, only if time allows, roughly in order of expected value: (a)
    cap simulated stint length at each compound's `max_observed_tyre_life`
    instead of just warning about it, so the simulator can't recommend an
@@ -196,7 +250,9 @@ involve.
 ingestion/    load_session.py -- FastF1 pull + cache + quality check
 features/     clean.py -- filtering + fuel correction
 models/       degradation.py (per-compound fit), simulate.py (strategy search)
-pipeline/     run_pipeline.py -- chains ingestion -> clean -> degradation -> simulate
+pipeline/     run_pipeline.py (single race, full chain incl. simulate)
+              run_all_races.py (full 2025 calendar, ingestion->clean->degradation only)
+              summarize_results.py (season-wide table from the batch run)
 config/       races.json -- season, race list, compound-labeling notes
 experiments/  degradation_results.jsonl -- one line per race fit
 tests/        test_clean.py

@@ -58,6 +58,13 @@ def clean_laps(laps: pd.DataFrame) -> pd.DataFrame:
     # already logged as green by the time it's recorded.
     df = df[df["TyreLife"] > 2]
 
+    # Force a real copy before adding columns. Every `df = df[condition]`
+    # above returns a filtered slice that pandas can't always guarantee is
+    # independent of the original -- writing new columns onto it can raise
+    # SettingWithCopyWarning. The result was still correct here, but this
+    # removes the ambiguity instead of relying on that being true by luck.
+    df = df.copy()
+
     df["LapTimeSeconds"] = df["LapTime"].dt.total_seconds()
 
     # Fuel correction: the car is heaviest (slowest, fuel-wise) on lap 1 and
