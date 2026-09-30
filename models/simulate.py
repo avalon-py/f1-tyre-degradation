@@ -28,8 +28,45 @@ EXPERIMENTS_DIR = Path(__file__).resolve().parent.parent / "experiments"
 PIT_LOSS_SECONDS = 22.0
 
 
-def load_degradation(race: str, year: int) -> dict:
-    """Pulls the most recent fit for this race from the degradation log."""
+def load_degradation(race: str, year: int, min_pct_positive: float = 0.5,
+                      required_compounds: list | None = None) -> dict:
+    """
+    Pulls the most recent fit for this race from the degradation log.
+    Drops any compound whose pct_stints_positive_slope is below
+    min_pct_positive -- a low value means most individual stints didn't
+    even show degradation in the expected direction, so the fit isn't
+    trustworthy enough to steer a strategy decision.
+
+    Known case: Bahrain 2025 HARD is excluded by this check. Every HARD
+    stint in that race was either a car's final stint (drivers running a
+    conserve-early/push-late pace once no stops were left -- real
+    race-craft, not tyre physics) or started right at the lap-32 safety
+    car restart. Confirmed via stint-start-lap inspection: all 14 HARD
+    stints clustered at exactly those two situations, so there's no clean
+    subsample left in this race to fit HARD degradation from. Revisit once
+    a race is added (Day 6) where HARD is used mid-race under green flag.
+
+    required_compounds: if given (e.g. a user explicitly wants to compare
+    SOFT at this circuit), any compound in this list that isn't usable
+    raises a clear, specific error instead of the default behavior, which
+    is to silently drop unreliable compounds and proceed with whatever's
+    left. Two distinct failure reasons are surfaced separately, because
+    they mean different things:
+      - NEVER FIT: the compound doesn't appear in the degradation log at
+        all for this race -- there weren't enough long enough stints
+        (>=3 stints of >=6 laps) to fit a slope from. Common for compounds
+        only used for a short opening stint (see e.g. several 2025 races
+        where SOFT never got fit). No amount of threshold-tuning fixes
+        this -- the underlying laps to fit from don't exist.
+      - BELOW RELIABILITY THRESHOLD: the compound WAS fit, but most
+        individual stints disagreed on direction (see Bahrain HARD above).
+        This one *can* be overridden by lowering min_pct_positive, since
+        the data exists -- it's just noisy or confounded.
+    Without required_compounds, both cases are just logged and skipped, as
+    before -- that's the right default for "find me the best strategy from
+    whatever's trustworthy," but the wrong default for "specifically tell
+    me what happens if I use SOFT here."
+    """
     log_path = EXPERIMENTS_DIR / "degradation_results.jsonl"
     latest = None
     with open(log_path) as f:
@@ -39,7 +76,45 @@ def load_degradation(race: str, year: int) -> dict:
                 latest = entry
     if latest is None:
         raise ValueError(f"No degradation fit found for {race} {year}. Run models.degradation first.")
-    return latest["compounds"]
+
+    all_fit = latest["compounds"]
+    compounds = {}
+    for name, params in all_fit.items():
+        pct_positive = params.get("pct_stints_positive_slope", 1.0)
+        if pct_positive < min_pct_positive:
+            logger.warning(
+                "Excluding %s from simulation: only %.0f%% of stints showed positive "
+                "degradation (below %.0f%% threshold). See load_degradation docstring.",
+                name, 100 * pct_positive, 100 * min_pct_positive,
+            )
+            continue
+        compounds[name] = params
+
+    if required_compounds:
+        for name in required_compounds:
+            if name not in all_fit:
+                raise ValueError(
+                    f"Cannot simulate {name} at {race} {year}: it was never fit -- no "
+                    f"compound with enough long stints to model degradation from. This "
+                    f"circuit/race simply doesn't have usable {name} data, not a threshold "
+                    f"issue. Compounds that WERE fit here: {list(all_fit.keys())}."
+                )
+            if name not in compounds:
+                pct = all_fit[name]["pct_stints_positive_slope"]
+                raise ValueError(
+                    f"Cannot simulate {name} at {race} {year}: only {100*pct:.0f}% of its "
+                    f"stints showed positive degradation (below the {100*min_pct_positive:.0f}% "
+                    f"threshold), so the fit isn't trustworthy. Data exists but is noisy/"
+                    f"confounded -- pass a lower --min-pct-positive to override if you "
+                    f"understand why (see load_degradation docstring for the Bahrain HARD case)."
+                )
+
+    if len(compounds) < 2:
+        raise ValueError(
+            f"Fewer than 2 trustworthy compounds for {race} {year} -- can't simulate a "
+            "two-stop strategy. Lower min_pct_positive or investigate the excluded compound(s)."
+        )
+    return compounds
 
 
 def lap_time(compound_params: dict, tyre_age: int) -> float:
@@ -58,6 +133,14 @@ def simulate_strategy(compounds: dict, total_laps: int, pit_lap: int,
 
 
 def find_best_strategy(compounds: dict, total_laps: int) -> dict:
+    """
+    Best strategy is found across ALL pit laps (the model needs the full
+    picture to compare options fairly), but flagged if either resulting
+    stint length exceeds the longest stint actually observed for that
+    compound -- past that point the linear degradation fit is
+    extrapolating, and a real tyre could behave very differently (a
+    cliff-off is common and this model can't see it).
+    """
     available = list(compounds.keys())
     best = {"time_s": float("inf")}
 
@@ -65,12 +148,31 @@ def find_best_strategy(compounds: dict, total_laps: int) -> dict:
         for pit_lap in range(3, total_laps - 2):
             t = simulate_strategy(compounds, total_laps, pit_lap, c1, c2)
             if t < best["time_s"]:
+                stint_2_length = total_laps - pit_lap
                 best = {
                     "time_s": round(t, 1),
                     "compound_1": c1,
                     "compound_2": c2,
                     "pit_lap": pit_lap,
+                    "stint_1_length": pit_lap,
+                    "stint_2_length": stint_2_length,
                 }
+
+    max_1 = compounds[best["compound_1"]].get("max_observed_tyre_life")
+    max_2 = compounds[best["compound_2"]].get("max_observed_tyre_life")
+    extrapolated = []
+    if max_1 is not None and best["stint_1_length"] > max_1:
+        extrapolated.append(f"{best['compound_1']} stint ({best['stint_1_length']} laps > {max_1} observed)")
+    if max_2 is not None and best["stint_2_length"] > max_2:
+        extrapolated.append(f"{best['compound_2']} stint ({best['stint_2_length']} laps > {max_2} observed)")
+    best["extrapolated_beyond_data"] = extrapolated
+    if extrapolated:
+        logger.warning(
+            "Best strategy extrapolates beyond observed data: %s. Treat this "
+            "recommendation with caution -- the linear model has no evidence "
+            "for how the tyre actually behaves that far into a stint.",
+            "; ".join(extrapolated),
+        )
     return best
 
 
@@ -79,9 +181,28 @@ if __name__ == "__main__":
     parser.add_argument("--year", type=int, default=2025)
     parser.add_argument("--race", type=str, required=True)
     parser.add_argument("--total-laps", type=int, required=True)
+    parser.add_argument(
+        "--min-pct-positive", type=float, default=0.4,
+        help="Minimum fraction of stints that must show positive degradation "
+             "for a compound to be trusted in the simulation. Default 0.4 -- "
+             "lowered from a stricter 0.5 because Bahrain 2025 showed weak "
+             "degradation overall; tighten this for higher-deg circuits.",
+    )
+    parser.add_argument(
+        "--compounds", type=str, nargs="*", default=None,
+        help="Force the simulation to use exactly these compounds (e.g. "
+             "--compounds SOFT HARD), instead of auto-selecting whatever's "
+             "reliable. Raises a clear error naming why a compound can't be "
+             "used (never fit, vs. fit but unreliable) rather than silently "
+             "leaving it out.",
+    )
     args = parser.parse_args()
 
-    compounds = load_degradation(args.race, args.year)
+    compounds = load_degradation(args.race, args.year, args.min_pct_positive, args.compounds)
+    if args.compounds:
+        compounds = {name: compounds[name] for name in args.compounds}
+    logger.info("Simulating with compounds: %s", list(compounds.keys()))
+
     best = find_best_strategy(compounds, args.total_laps)
 
     logger.info("Best strategy for %s %s: %s", args.year, args.race, best)
