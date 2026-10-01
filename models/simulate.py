@@ -132,23 +132,20 @@ def simulate_strategy(compounds: dict, total_laps: int, pit_lap: int,
     return total
 
 
-def find_best_strategy(compounds: dict, total_laps: int) -> dict:
-    """
-    Best strategy is found across ALL pit laps (the model needs the full
-    picture to compare options fairly), but flagged if either resulting
-    stint length exceeds the longest stint actually observed for that
-    compound -- past that point the linear degradation fit is
-    extrapolating, and a real tyre could behave very differently (a
-    cliff-off is common and this model can't see it).
-    """
+def _search(compounds: dict, total_laps: int, enforce_cap: bool) -> dict:
     available = list(compounds.keys())
     best = {"time_s": float("inf")}
-
     for c1, c2 in itertools.permutations(available, 2):
+        cap_1 = compounds[c1].get("max_observed_tyre_life") if enforce_cap else None
+        cap_2 = compounds[c2].get("max_observed_tyre_life") if enforce_cap else None
         for pit_lap in range(3, total_laps - 2):
+            stint_2_length = total_laps - pit_lap
+            if cap_1 is not None and pit_lap > cap_1:
+                continue
+            if cap_2 is not None and stint_2_length > cap_2:
+                continue
             t = simulate_strategy(compounds, total_laps, pit_lap, c1, c2)
             if t < best["time_s"]:
-                stint_2_length = total_laps - pit_lap
                 best = {
                     "time_s": round(t, 1),
                     "compound_1": c1,
@@ -157,6 +154,32 @@ def find_best_strategy(compounds: dict, total_laps: int) -> dict:
                     "stint_1_length": pit_lap,
                     "stint_2_length": stint_2_length,
                 }
+    return best
+
+
+def find_best_strategy(compounds: dict, total_laps: int, enforce_cap: bool = True) -> dict:
+    """
+    Linear degradation is only evidence-backed inside the range of tyre ages
+    actually observed. Race stints stop before a tyre's cliff (teams pit
+    first), so the data says nothing about what happens beyond
+    max_observed_tyre_life -- and a linear model happily prices those laps
+    as cheap. So by default a stint may not be longer than the longest
+    stint observed for that compound (the cap; for borrowed compounds, the
+    season median of that figure).
+
+    This is a one-stop simulator. If the caps make a one-stop race
+    impossible (e.g. a 57-lap race where the longest observed stint is 25
+    laps, so two stints can't cover it -- a two-stop race), there is no
+    honest answer here: we fall back to the uncapped search and set
+    cap_infeasible=True so the caller can see that the result is entirely
+    extrapolation, and the extrapolated_beyond_data flag lists which stints.
+    """
+    best = _search(compounds, total_laps, enforce_cap) if enforce_cap else None
+    cap_infeasible = False
+    if best is None or best["time_s"] == float("inf"):
+        cap_infeasible = enforce_cap
+        best = _search(compounds, total_laps, enforce_cap=False)
+    best["cap_infeasible"] = cap_infeasible
 
     max_1 = compounds[best["compound_1"]].get("max_observed_tyre_life")
     max_2 = compounds[best["compound_2"]].get("max_observed_tyre_life")
@@ -168,10 +191,11 @@ def find_best_strategy(compounds: dict, total_laps: int) -> dict:
     best["extrapolated_beyond_data"] = extrapolated
     if extrapolated:
         logger.warning(
-            "Best strategy extrapolates beyond observed data: %s. Treat this "
+            "Best strategy extrapolates beyond observed data: %s%s. Treat this "
             "recommendation with caution -- the linear model has no evidence "
             "for how the tyre actually behaves that far into a stint.",
             "; ".join(extrapolated),
+            " (no one-stop strategy fits inside the observed stint lengths)" if cap_infeasible else "",
         )
     return best
 

@@ -24,12 +24,16 @@ CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
 RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
 
 
-def load_race_laps(year: int, race: str, session_type: str = "R") -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_race(year: int, race: str, session_type: str = "R") -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Load lap-level data for one session.
+    Load lap-level data for one session. Returns (laps, track_status).
 
-    Returns (laps, track_status). track_status holds the SC / VSC / red-flag
-    start and end times, needed to drop restart laps for every driver.
+    laps is FastF1's laps DataFrame with driver, lap time, compound, tyre
+    life, pit flags, and per-lap track status attached -- no telemetry
+    pulled, this stays lap-level by design. track_status is FastF1's
+    session.track_status (SC / VSC / red-flag start and end times), needed
+    to drop restart laps. It's returned separately on purpose: stashing a
+    DataFrame in laps.attrs breaks laps.to_parquet (pyarrow JSON-encodes attrs).
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     fastf1.Cache.enable_cache(str(CACHE_DIR))
@@ -46,16 +50,21 @@ def load_race_laps(year: int, race: str, session_type: str = "R") -> tuple[pd.Da
     return laps, track_status
 
 
-def save_raw(laps: pd.DataFrame, track_status: pd.DataFrame, year: int, race: str) -> Path:
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    stem = f"{year}_{race.replace(' ', '_')}"
-    laps_path = RAW_DIR / f"{stem}_laps.parquet"
-    status_path = RAW_DIR / f"{stem}_track_status.parquet"
+def load_race_laps(year: int, race: str, session_type: str = "R") -> pd.DataFrame:
+    """Laps only (kept for callers that don't need track status)."""
+    return load_race(year, race, session_type)[0]
 
-    laps.to_parquet(laps_path, index=False)
-    track_status.to_parquet(status_path, index=False)
-    logger.info("Saved raw laps to %s and track status to %s", laps_path, status_path)
-    return laps_path
+
+def save_raw(laps: pd.DataFrame, year: int, race: str,
+             track_status: pd.DataFrame | None = None) -> Path:
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = RAW_DIR / f"{year}_{race.replace(' ', '_')}_laps.parquet"
+    laps.to_parquet(out_path, index=False)
+    logger.info("Saved raw laps to %s", out_path)
+    if track_status is not None:
+        track_status.to_parquet(
+            out_path.with_name(out_path.name.replace("_laps.", "_track_status.")), index=False)
+    return out_path
 
 
 def check_race_quality(laps: pd.DataFrame) -> dict:
@@ -84,8 +93,8 @@ if __name__ == "__main__":
     parser.add_argument("--session", type=str, default="R")
     args = parser.parse_args()
 
-    laps, track_status = load_race_laps(args.year, args.race, args.session)
-    save_raw(laps, track_status, args.year, args.race)
+    laps, track_status = load_race(args.year, args.race, args.session)
+    save_raw(laps, args.year, args.race, track_status)
 
     quality = check_race_quality(laps)
     logger.info("Quality check: %s", quality)

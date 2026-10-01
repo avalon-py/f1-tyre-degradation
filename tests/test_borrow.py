@@ -39,3 +39,17 @@ def test_not_enough_season_data_to_borrow():
 def test_races_with_two_good_compounds_are_left_alone():
     records = [full_race(f"R{i}") for i in range(4)]
     assert borrow_missing(records) == []
+
+def test_borrowed_compounds_get_season_median_stint_cap():
+    def capped(offset, caps):
+        r = full_race("x", offset)
+        for name, cap in caps.items():
+            r["compounds"][name]["max_observed_tyre_life"] = cap
+        return r
+    records = [{**capped(i, {"SOFT": 20 + i, "MEDIUM": 30, "HARD": 40}), "race": f"R{i}"} for i in range(4)]
+    records.append(race("Miami", {"MEDIUM": comp(95, -0.3, pct=0.1),
+                                  "HARD": {**comp(96, 0.04), "max_observed_tyre_life": 35}},
+                        status="skipped"))
+    miami = borrow_missing(records)[0]
+    assert miami["borrowed"]["SOFT"]["max_observed_tyre_life"] == 22   # median of 20..23 = 21.5 -> 22
+    assert miami["borrowed"]["MEDIUM"]["max_observed_tyre_life"] == 30

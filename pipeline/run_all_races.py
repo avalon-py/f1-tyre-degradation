@@ -33,7 +33,7 @@ import fastf1
 import numpy as np
 
 from features.clean import DRY_COMPOUNDS, clean_laps, fuel_s_per_lap
-from ingestion.load_session import check_race_quality, load_race_laps, save_raw
+from ingestion.load_session import check_race_quality, load_race, save_raw
 from models.degradation import fit_degradation, log_result
 from models.simulate import find_best_strategy
 
@@ -65,8 +65,8 @@ def skip_reason(quality: dict) -> str | None:
 
 
 def run_one_race(year: int, race: str) -> dict:
-    laps = load_race_laps(year, race, "R")
-    save_raw(laps, year, race)
+    laps, track_status = load_race(year, race, "R")
+    save_raw(laps, year, race, track_status)
     quality = check_race_quality(laps)
 
     # Winner's lap count = highest LapNumber in the data. Would be too low
@@ -83,7 +83,7 @@ def run_one_race(year: int, race: str) -> dict:
     if reason:
         return {**record, "status": "skipped", "reason": reason}
 
-    cleaned = clean_laps(laps, total_laps, laps.attrs.get("track_status"))
+    cleaned = clean_laps(laps, total_laps, track_status)
     degradation = fit_degradation(cleaned, race_label=f"{year} {race}")
     log_result(race, year, degradation)
     record["compounds"] = degradation
@@ -105,27 +105,29 @@ def trustworthy(compounds: dict) -> dict:
             if p["pct_stints_positive_slope"] >= MIN_PCT_POSITIVE}
 
 
-def season_medians(records: list[dict]) -> tuple[dict, dict]:
-    """Season-wide (slope, pace offset vs MEDIUM) per compound, from races
-    where the compound was trustworthy. Compounds with too little evidence
-    are left out."""
-    slopes, offsets = {}, {}
+def season_medians(records: list[dict]) -> tuple[dict, dict, dict]:
+    """Season-wide (slope, pace offset vs MEDIUM, longest observed stint) per
+    compound, from races where the compound was trustworthy. Compounds with
+    too little evidence are left out."""
+    slopes, offsets, caps = {}, {}, {}
     for r in records:
         good = trustworthy(r.get("compounds", {}))
         for name, p in good.items():
             slopes.setdefault(name, []).append(p["slope_s_per_lap"])
+            if "max_observed_tyre_life" in p:
+                caps.setdefault(name, []).append(p["max_observed_tyre_life"])
             if "MEDIUM" in good:
                 offsets.setdefault(name, []).append(
                     p["intercept_s"] - good["MEDIUM"]["intercept_s"])
     med = lambda d: {n: float(np.median(v)) for n, v in d.items() if len(v) >= MIN_RACES_TO_BORROW}
-    return med(slopes), med(offsets)
+    return med(slopes), med(offsets), med(caps)
 
 
 def borrow_missing(records: list[dict]) -> list[dict]:
     """For each race with exactly one trustworthy compound, borrow the other
     dry compounds from the season and simulate. Returns new records (the
     originals are not modified)."""
-    slopes, offsets = season_medians(records)
+    slopes, offsets, caps = season_medians(records)
     new = []
     for r in records:
         good = trustworthy(r.get("compounds", {}))
@@ -137,7 +139,9 @@ def borrow_missing(records: list[dict]) -> list[dict]:
             continue
         borrowed = {
             c: {"intercept_s": round(own["intercept_s"] - offsets[anchor] + offsets[c], 3),
-                "slope_s_per_lap": round(slopes[c], 4)}
+                "slope_s_per_lap": round(slopes[c], 4),
+                # season median of the longest observed stint -> stint-length cap
+                **({"max_observed_tyre_life": int(round(caps[c]))} if c in caps else {})}
             for c in DRY_COMPOUNDS - {anchor} if c in slopes and c in offsets
         }
         if not borrowed:
